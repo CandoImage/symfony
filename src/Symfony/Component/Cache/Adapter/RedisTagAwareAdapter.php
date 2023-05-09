@@ -22,6 +22,7 @@ use Symfony\Component\Cache\Exception\LogicException;
 use Symfony\Component\Cache\Marshaller\DeflateMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
 use Symfony\Component\Cache\Marshaller\TagAwareMarshaller;
+use Symfony\Component\Cache\PruneableInterface;
 use Symfony\Component\Cache\Traits\RedisClusterProxy;
 use Symfony\Component\Cache\Traits\RedisProxy;
 use Symfony\Component\Cache\Traits\RedisTrait;
@@ -45,7 +46,7 @@ use Symfony\Component\Cache\Traits\RedisTrait;
  * @author Nicolas Grekas <p@tchwork.com>
  * @author André Rømcke <andre.romcke+symfony@gmail.com>
  */
-class RedisTagAwareAdapter extends AbstractTagAwareAdapter
+class RedisTagAwareAdapter extends AbstractTagAwareAdapter implements PruneableInterface
 {
     use RedisTrait;
 
@@ -321,5 +322,185 @@ EOLUA;
         }
 
         return $this->redisEvictionPolicy = '';
+    }
+
+
+    protected function getPrefix(): string
+    {
+        if ($this->redis instanceof \Predis\ClientInterface) {
+            $prefix = $this->redis->getOptions()->prefix ? $this->redis->getOptions()->prefix->getPrefix() : '';
+        } elseif (\is_array($prefix = $this->redis->getOption(\Redis::OPT_PREFIX) ?? '')) {
+            $prefix = current($prefix);
+        }
+        return $prefix;
+    }
+
+    /**
+     * Gets all SET entries that are tagged with the TAGS_PREFIX constant
+     *
+     *
+     * @return array
+     */
+    public function getTagSetIds(): array
+    {
+        $setIds = [];
+        $prefix = $this->getPrefix();
+        // need to trim the \0 for lua script
+        $tagsPrefix = trim(self::TAGS_PREFIX);
+
+        // get all SET entries which are tagged
+        $getTagsLua = <<<'EOLUA'
+            redis.replicate_commands()
+
+            local cursor = ARGV[1]
+            local prefix = ARGV[2]
+            local tagPrefix = string.gsub(KEYS[1], prefix, "")
+
+            return redis.call('SCAN', cursor, 'COUNT', 5000, 'MATCH', '*' .. tagPrefix .. '*', 'TYPE', 'set')
+        EOLUA;
+        $cursor = '0';
+        do {
+            $results = $this->pipeline(function () use ($getTagsLua, $cursor, $prefix, $tagsPrefix) {
+                yield 'eval' => [$getTagsLua, [$tagsPrefix, $cursor, $prefix], 1];
+            });
+
+            $setKeys = $results->valid() ? iterator_to_array($results) : [];
+            [$cursor, $ids] = $setKeys[$tagsPrefix] ?? [null, null];
+            // merge the fetched ids together
+            $setIds = array_merge($setIds, $ids);
+
+        } while ('0' !== $cursor);
+
+        return $setIds;
+    }
+
+
+    public function getOrphandSets(bool $compressMode = false): array
+    {
+        $prefix = $this->getPrefix();
+        $setIds = $this->getTagSetIds();
+
+        // lua for fetching all entries/content from a SET
+        $getSetContentLua = <<<'EOLUA'
+            redis.replicate_commands()
+
+            local cursor = ARGV[1]
+
+            return redis.call('SSCAN', KEYS[1], cursor, 'COUNT', 5000)
+        EOLUA;
+
+        $cursor = '0';
+        $hasExistingKeys = false;
+        $compressibleKeys = [];
+        $orphandKeys = [];
+        // iterate over each SET key
+        foreach ($setIds as $id) {
+            $id = substr($id, strlen($prefix));
+            do {
+                // fetch content from a SET entry
+                $results = $this->pipeline(function () use ($getSetContentLua, $id, $cursor) {
+                    yield 'eval' => [$getSetContentLua, [$id, $cursor], 1];
+                });
+
+                $setContent = $results->valid() ? iterator_to_array($results) : [];
+                [$cursor, $content] = $setContent[$id] ?? [null, null];
+
+                // check if another key exists with from the SET content
+                if (!empty($content)) {
+                    $exitingItemResult = $this->pipeline(function () use ($content) {
+                        yield 'exists' => $content;
+                    });
+
+                    $exitingItem = $exitingItemResult->valid() ? iterator_to_array($exitingItemResult) : [];
+                    // check if at least the first item has references
+                    $hasExistingKeys = reset($exitingItem) > 0 ?? false;
+
+                    // if any other key exists, the item could be checked by its references to compress
+                    if ($hasExistingKeys && $compressMode) {
+                        $membersCount = count($content);
+                        $referenceCount = reset($exitingItem);
+                        // check if we have a difference from the member content between the searched references
+                        if ($membersCount > $referenceCount) {
+                            // if we have a different we have a tag with dead reference which could be cleaned up
+                            foreach ($content as $member) {
+                                $existingMemberResult = $this->pipeline(function () use ($member) {
+                                    yield 'exists' => [$member];
+                                });
+
+                                $exitingMember = $existingMemberResult->valid() ? iterator_to_array($existingMemberResult) : [];
+                                $hasExistingMember = reset($exitingMember) > 0 ?? false;
+                                if (!$hasExistingMember) {
+                                    $compressibleKeys[$id][] = $member;
+                                }
+                            }
+                        }
+                    }
+                    if (!$hasExistingKeys) {
+                        $orphandKeys[] = $id;
+                        break;
+                    }
+                }
+            } while ('0' !== $cursor);
+        }
+        if ($compressMode) {
+            return ['orphanedKeys' => $orphandKeys, 'compressibleKeys' => $compressibleKeys, 'tags' => $setIds];
+        }
+
+        return ['orphanedKeys' => $orphandKeys, 'tags' => $setIds];
+    }
+
+
+    public function deleteOrphandSets(bool $compressMode = false): bool
+    {
+        $orphandSet = $this->getOrphandSets($compressMode);
+
+        // remove all orphaned keys
+        foreach ($orphandSet['orphanedKeys'] as $orphanedKey) {
+            $result = $this->pipeline(function () use ($orphanedKey) {
+                yield 'del' => [$orphanedKey];
+            });
+            $executionResult = $result->valid() ? iterator_to_array($result) : [];
+            if (reset($executionResult) <> 1) {
+                return false;
+            }
+        }
+        if ($compressMode) {
+            // lua for deleting member from a SET
+            $removeSetMemberLua = <<<'EOLUA'
+                redis.replicate_commands()
+
+                return redis.call('SREM', KEYS[1], KEYS[2])
+            EOLUA;
+            // loop through all compressed keys and search its reference
+            foreach ($orphandSet['compressibleKeys'] as $set => $members) {
+                foreach ($members as $member) {
+                    $executionResult = $this->pipeline(function () use ($removeSetMemberLua, $set, $member) {
+                        yield 'srem' => [$set, $member];
+                    });
+                    $executionResult = $executionResult->valid() ? iterator_to_array($executionResult) : [];
+                    $deletionResult = $executionResult[$set] > 0 ?? false;
+                    if (!$executionResult) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    public function deleteMembers($a = null, $b = null)
+    {
+        $removeSetMemberLua = <<<'EOLUA'
+                redis.replicate_commands()
+
+                return redis.call('SREM', KEYS[1], KEYS[2])
+            EOLUA;
+        return ['eval' => [$removeSetMemberLua, [$a, $b], 1]];
+    }
+
+
+    public function prune()
+    {
+        return $this->deleteOrphandSets(true);
     }
 }

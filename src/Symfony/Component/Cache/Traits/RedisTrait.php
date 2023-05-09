@@ -45,7 +45,7 @@ trait RedisTrait
         'failover' => 'none',
         'ssl' => null, // see https://php.net/context.ssl
     ];
-    private $redis;
+    protected $redis;
     private $marshaller;
 
     /**
